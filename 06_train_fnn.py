@@ -3,7 +3,7 @@ import numpy as np
 import tensorflow as tf
 
 DATA_DIR = r"C:\\Users\\anakh\\Desktop\\MINI PROJECT\\muscle-bmode-images\\B-Bilder"  # <-- RAW images folder
-IMG_SIZE = (320, 320)   # FNN needs smaller size (otherwise too many parameters)
+IMG_SIZE = (320, 320)   
 BATCH_SIZE = 16
 EPOCHS = 20
 LR = 1e-3
@@ -12,9 +12,9 @@ SEED = 42
 tf.random.set_seed(SEED)
 np.random.seed(SEED)
 
-# -----------------------
+
 # 1) LOAD FILE PATHS + LABELS
-# -----------------------
+
 paths, labels = [], []
 for fname in os.listdir(DATA_DIR):
     if not fname.lower().endswith(".png"):
@@ -42,9 +42,9 @@ print("Transversal:", int(np.sum(labels == 1)))
 idx = np.random.permutation(len(paths))
 paths, labels = paths[idx], labels[idx]
 
-# -----------------------
+
 # SPLIT: 70% TRAIN, 10% VAL, 20% TEST
-# -----------------------
+
 n_total = len(paths)
 n_train = max(1, int(0.7 * n_total))
 n_val = max(1, int(0.1 * n_total))
@@ -63,9 +63,9 @@ print("Train:", len(train_paths))
 print("Val  :", len(val_paths))
 print("Test :", len(test_paths))
 
-# -----------------------
+
 # 2) PREPROCESS FUNCTION
-# -----------------------
+
 def load_preprocess(path, label):
     img_bytes = tf.io.read_file(path)
     img = tf.io.decode_png(img_bytes, channels=1)
@@ -83,9 +83,8 @@ def load_preprocess(path, label):
 
     return img, tf.cast(label, tf.float32)
 
-# -----------------------
 # 3) DATASETS
-# -----------------------
+
 AUTOTUNE = tf.data.AUTOTUNE
 
 train_ds = tf.data.Dataset.from_tensor_slices((train_paths, train_labels))
@@ -98,9 +97,8 @@ val_ds = val_ds.map(load_preprocess, num_parallel_calls=AUTOTUNE).batch(BATCH_SI
 test_ds = tf.data.Dataset.from_tensor_slices((test_paths, test_labels))
 test_ds = test_ds.map(load_preprocess, num_parallel_calls=AUTOTUNE).batch(BATCH_SIZE).prefetch(AUTOTUNE)
 
-# -----------------------
-# 4) FNN MODEL (Dense Network)
-# -----------------------
+
+# 4) FNN MODEL 
 input_dim = IMG_SIZE[0] * IMG_SIZE[1] * 1
 
 model = tf.keras.Sequential([
@@ -131,7 +129,7 @@ for epoch in range(1, EPOCHS + 1):
     train_acc.reset_state()
     val_acc.reset_state()
 
-    # ---- TRAINING ----
+    # TRAINING 
     for x_batch, y_batch in train_ds:
         with tf.GradientTape() as tape:
             logits = model(x_batch, training=True)
@@ -143,7 +141,7 @@ for epoch in range(1, EPOCHS + 1):
         probs = tf.sigmoid(logits)
         train_acc.update_state(y_batch, probs)
 
-    # ---- VALIDATION ----
+    # VALIDATION
     for x_batch, y_batch in val_ds:
         logits_val = model(x_batch, training=False)
         probs_val = tf.sigmoid(logits_val)
@@ -160,9 +158,8 @@ for epoch in range(1, EPOCHS + 1):
 
 print("\n Best validation accuracy:", best_val_acc)
 
-# -----------------------
+
 # 6) TEST EVALUATION + CONFUSION MATRIX
-# -----------------------
 y_true, y_pred = [], []
 test_acc.reset_state()
 
@@ -188,6 +185,8 @@ print(cm)
 print("Labels: 0 = Longitudinal, 1 = Transversal")
 model.save("fnn_final.keras")
 print(" FNN model saved as fnn_final.keras")
+
+# RESULT I GOT
 # Best validation accuracy: 0.8837209343910217
 
 #TEST RESULTS
@@ -196,4 +195,4 @@ print(" FNN model saved as fnn_final.keras")
 ##[[40  3]
  #[ 1 45]]
 #Labels: 0 = Longitudinal, 1 = Transversal
-# FNN model saved as fnn_final.keras
+
