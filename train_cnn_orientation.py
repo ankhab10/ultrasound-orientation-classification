@@ -1,15 +1,10 @@
-# CNN training with CLAHE preprocessing (for dark ultrasound images)
-# NOTE: requires OpenCV:
-# pip install opencv-python
-
 import os
 import numpy as np
 import tensorflow as tf
 import cv2
 
-# -----------------------
-# SETTINGS (CHANGE ONLY DATA_DIR)
-# -----------------------
+# SETTINGS 
+
 DATA_DIR = r"C:\\Users\\anakh\\Desktop\\MINI PROJECT\\muscle-bmode-images\\B-Bilder"
 IMG_SIZE = (128, 128)
 BATCH_SIZE = 16
@@ -20,9 +15,8 @@ SEED = 42
 tf.random.set_seed(SEED)
 np.random.seed(SEED)
 
-# -----------------------
+
 # 1) LOAD FILE PATHS + LABELS
-# -----------------------
 paths, labels = [], []
 
 for fname in os.listdir(DATA_DIR):
@@ -49,9 +43,7 @@ print("Total images:", len(paths))
 print("Longitudinal:", int(np.sum(labels == 0)))
 print("Transversal:", int(np.sum(labels == 1)))
 
-# -----------------------
 # 2) TRAIN / VAL / TEST SPLIT
-# -----------------------
 idx = np.random.permutation(len(paths))
 paths, labels = paths[idx], labels[idx]
 
@@ -73,9 +65,8 @@ print("Train:", len(train_paths))
 print("Val  :", len(val_paths))
 print("Test :", len(test_paths))
 
-# -----------------------
-# 3) CLAHE FUNCTION (NumPy/OpenCV)
-# -----------------------
+# 3) CLAHE FUNCTION 
+
 def clahe_numpy(gray_img_2d: np.ndarray) -> np.ndarray:
     gray_img_2d = np.clip(gray_img_2d, 0.0, 1.0)
     img_uint8 = (gray_img_2d * 255.0).astype(np.uint8)
@@ -85,38 +76,33 @@ def clahe_numpy(gray_img_2d: np.ndarray) -> np.ndarray:
 
     return out.astype(np.float32) / 255.0
 
-# -----------------------
+
 # 4) PREPROCESSING FUNCTION (WITH CLAHE)
-# -----------------------
 def load_preprocess(path, label):
     img_bytes = tf.io.read_file(path)
     img = tf.io.decode_png(img_bytes, channels=1)
     img = tf.cast(img, tf.float32)
 
-    # keep aspect ratio (important for ultrasound)
+    # keep aspect ratio 
     img = tf.image.resize_with_pad(img, IMG_SIZE[0], IMG_SIZE[1], method="nearest")
 
     # scale to [0,1]
     img = img / 255.0
     img = tf.clip_by_value(img, 0.0, 1.0)
 
-    # apply CLAHE (local contrast enhancement)
+    # apply CLAHE 
     img_2d = img[..., 0]  # (H,W)
     img_2d = tf.numpy_function(func=clahe_numpy, inp=[img_2d], Tout=tf.float32)
 
-    # restore shape info (important because numpy_function loses static shape)
+    # restore shape info 
     img_2d.set_shape([IMG_SIZE[0], IMG_SIZE[1]])
     img = tf.expand_dims(img_2d, axis=-1)  # back to (H,W,1)
 
-    # IMPORTANT CHANGE:
-    # removed per_image_standardization because it can hurt after CLAHE for ultrasound
-    # img = tf.image.per_image_standardization(img)
+ 
 
     return img, tf.cast(label, tf.float32)
 
-# -----------------------
 # 5) DATASETS
-# -----------------------
 AUTOTUNE = tf.data.AUTOTUNE
 
 train_ds = tf.data.Dataset.from_tensor_slices((train_paths, train_labels))
@@ -129,9 +115,7 @@ val_ds = val_ds.map(load_preprocess, num_parallel_calls=AUTOTUNE).batch(BATCH_SI
 test_ds = tf.data.Dataset.from_tensor_slices((test_paths, test_labels))
 test_ds = test_ds.map(load_preprocess, num_parallel_calls=AUTOTUNE).batch(BATCH_SIZE).prefetch(AUTOTUNE)
 
-# -----------------------
 # 6) SIMPLE CNN MODEL
-# -----------------------
 model = tf.keras.Sequential([
     tf.keras.layers.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 1)),
 
@@ -144,20 +128,18 @@ model = tf.keras.Sequential([
     tf.keras.layers.Conv2D(128, 3, padding="same", activation="relu"),
     tf.keras.layers.MaxPool2D(),
 
-    # NEW extra block (small upgrade)
     tf.keras.layers.Conv2D(256, 3, padding="same", activation="relu"),
     tf.keras.layers.MaxPool2D(),
 
     tf.keras.layers.GlobalAveragePooling2D(),
-    tf.keras.layers.Dense(128, activation="relu"),   # was 64
-    tf.keras.layers.Dropout(0.3),                    # add dropout
+    tf.keras.layers.Dense(128, activation="relu"),   
+    tf.keras.layers.Dropout(0.3),                 
     tf.keras.layers.Dense(1)
 ])
 
 
-# -----------------------
 # 7) LOSS + OPTIMIZER + METRICS
-# -----------------------
+
 loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 optimizer = tf.keras.optimizers.Adam(LR)
 
@@ -165,9 +147,9 @@ train_acc = tf.keras.metrics.BinaryAccuracy(threshold=0.5)
 val_acc = tf.keras.metrics.BinaryAccuracy(threshold=0.5)
 test_acc = tf.keras.metrics.BinaryAccuracy(threshold=0.5)
 
-# -----------------------
+
 # 8) TRAINING LOOP (WITH VALIDATION)
-# -----------------------
+
 print("\n Training CNN (with validation)...\n")
 
 best_val_acc = 0.0
@@ -176,7 +158,7 @@ for epoch in range(1, EPOCHS + 1):
     train_acc.reset_state()
     val_acc.reset_state()
 
-    # ---- TRAIN ----
+    # TRAIN 
     for x_batch, y_batch in train_ds:
         with tf.GradientTape() as tape:
             logits = model(x_batch, training=True)
@@ -188,7 +170,7 @@ for epoch in range(1, EPOCHS + 1):
         probs = tf.sigmoid(logits)
         train_acc.update_state(y_batch, probs)
 
-    # ---- VALIDATION ----
+    # VALIDATION
     for x_batch, y_batch in val_ds:
         logits_val = model(x_batch, training=False)
         probs_val = tf.sigmoid(logits_val)
@@ -205,9 +187,8 @@ for epoch in range(1, EPOCHS + 1):
 
 print("\nBest validation accuracy:", best_val_acc)
 
-# -----------------------
 # 9) TEST EVALUATION + CONFUSION MATRIX
-# -----------------------
+
 y_true, y_pred = [], []
 test_acc.reset_state()
 
@@ -232,10 +213,13 @@ print("Confusion matrix (rows=true, cols=pred):")
 print(cm)
 print("Labels: 0 = Longitudinal, 1 = Transversal")
 
+#These are the results i got after running the code
+
 #Best validation accuracy: 0.9069767594337463
 # TEST RESULTS
 #Test accuracy: 0.483146071434021
 #Confusion matrix (rows=true, cols=pred):
 #[[43  0]
  #[46  0]]
+
 #Labels: 0 = Longitudinal, 1 = Transversal
