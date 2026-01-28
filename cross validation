@@ -1,0 +1,315 @@
+# CNN training - CROSS VALIDATION version (Stratified K-Fold)
+# Keeps your enhanced preprocessing + model
+
+import os
+import json
+import numpy as np
+import tensorflow as tf
+import cv2
+import gc
+import matplotlib.pyplot as plt
+from datetime import datetime
+from sklearn.model_selection import StratifiedKFold
+
+# -----------------------
+# SETTINGS
+# -----------------------
+DATA_DIR = r"C:\\Users\\anakh\\Desktop\\MINI PROJECT\\muscle-bmode-images\\B-Bilder"
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 8
+LR = 1e-4
+SEED = 42
+EPOCHS = 100
+K_FOLDS = 5
+
+EXP_NAME = "cnn_enhanced_preprocessing_cv"
+RESULT_DIR = os.path.join("results", EXP_NAME)
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+tf.random.set_seed(SEED)
+np.random.seed(SEED)
+
+# -----------------------
+# 1) LOAD DATA
+# -----------------------
+paths, labels = [], []
+for fname in os.listdir(DATA_DIR):
+    if not fname.lower().endswith(".png"):
+        continue
+    name = fname.lower()
+    if "longitudinal" in name:
+        label = 0
+    elif "transversal" in name:
+        label = 1
+    else:
+        continue
+    paths.append(os.path.join(DATA_DIR, fname))
+    labels.append(label)
+
+paths = np.array(paths)
+labels = np.array(labels, dtype=np.int32)
+
+print("Total images:", len(paths))
+print("Longitudinal:", int(np.sum(labels == 0)))
+print("Transversal:", int(np.sum(labels == 1)))
+
+# -----------------------
+# 2) ENHANCED PREPROCESSING
+# -----------------------
+def enhance_image_py(img_np):
+    """Enhance dark ultrasound images - numpy function"""
+    img_2d = img_np.squeeze().astype(np.uint8)
+
+    # 1) CLAHE for contrast
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img_enhanced = clahe.apply(img_2d)
+
+    # 2) Normalize to use full range
+    min_val, max_val = img_enhanced.min(), img_enhanced.max()
+    if max_val > min_val:
+        img_enhanced = ((img_enhanced - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+
+    # 3) Slight sharpening to enhance edges
+    kernel = np.array([[-1, -1, -1],
+                       [-1,  9, -1],
+                       [-1, -1, -1]], dtype=np.float32)
+    img_sharp = cv2.filter2D(img_enhanced, -1, kernel)
+    img_sharp = np.clip(img_sharp, 0, 255).astype(np.uint8)
+
+    return img_sharp[..., np.newaxis]
+
+def load_preprocess(path, label, augment=False):
+    # Read image
+    img_bytes = tf.io.read_file(path)
+    img = tf.io.decode_png(img_bytes, channels=1)
+
+    # Resize FIRST to reduce computation
+    img = tf.image.resize(img, IMG_SIZE, method='bilinear')
+
+    # Apply enhancement (numpy_function)
+    img_uint8 = tf.cast(img, tf.uint8)
+    img = tf.numpy_function(enhance_image_py, [img_uint8], tf.uint8)
+    img.set_shape((IMG_SIZE[0], IMG_SIZE[1], 1))
+    img = tf.cast(img, tf.float32)
+
+    # Strong augmentation for training
+    if augment:
+        img = tf.image.random_flip_left_right(img)
+        img = tf.image.random_flip_up_down(img)
+        img = tf.image.random_brightness(img, max_delta=30)
+        img = tf.image.random_contrast(img, lower=0.8, upper=1.2)
+
+    # Normalize to [-1, 1]
+    img = img / 127.5 - 1.0
+
+    return img, label
+
+# -----------------------
+# 3) BUILD MODEL
+# -----------------------
+def build_model():
+    inputs = tf.keras.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 1))
+    x = inputs
+
+    x = tf.keras.layers.Conv2D(32, 3, padding='same', activation='relu')(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+
+    x = tf.keras.layers.Conv2D(64, 3, padding='same', activation='relu')(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+
+    x = tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu')(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dense(64, activation='relu')(x)
+    x = tf.keras.layers.Dropout(0.4)(x)
+
+    outputs = tf.keras.layers.Dense(1, activation='sigmoid')(x)
+    return tf.keras.Model(inputs, outputs)
+
+# -----------------------
+# 4) CROSS-VALIDATION TRAINING
+# -----------------------
+AUTOTUNE = tf.data.AUTOTUNE
+skf = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=SEED)
+
+fold_results = []
+fold_histories = []
+fold_accs = []
+fold_aucs = []
+
+for fold, (train_idx, val_idx) in enumerate(skf.split(paths, labels), start=1):
+    print("\n" + "="*60)
+    print(f"FOLD {fold}/{K_FOLDS}")
+    print("="*60)
+
+    train_paths = paths[train_idx]
+    train_labels = labels[train_idx]
+    val_paths = paths[val_idx]
+    val_labels = labels[val_idx]
+
+    print(f"Train: {len(train_paths)}, Val: {len(val_paths)}")
+
+    # Build datasets
+    train_ds = tf.data.Dataset.from_tensor_slices((train_paths, train_labels))
+    train_ds = (train_ds
+        .shuffle(len(train_paths), seed=SEED, reshuffle_each_iteration=True)
+        .map(lambda p, l: load_preprocess(p, l, augment=True), num_parallel_calls=AUTOTUNE)
+        .batch(BATCH_SIZE)
+        .prefetch(AUTOTUNE))
+
+    val_ds = tf.data.Dataset.from_tensor_slices((val_paths, val_labels))
+    val_ds = (val_ds
+        .map(lambda p, l: load_preprocess(p, l, augment=False), num_parallel_calls=AUTOTUNE)
+        .batch(BATCH_SIZE)
+        .prefetch(AUTOTUNE))
+
+    # Clear old model
+    tf.keras.backend.clear_session()
+    gc.collect()
+
+    model = build_model()
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=LR),
+        loss='binary_crossentropy',
+        metrics=[
+            'accuracy',
+            tf.keras.metrics.Precision(name='precision'),
+            tf.keras.metrics.Recall(name='recall'),
+            tf.keras.metrics.AUC(name='auc')
+        ]
+    )
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fold_tag = f"{run_id}_fold{fold}"
+    best_model_path = os.path.join(RESULT_DIR, f"best_{fold_tag}.keras")
+
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_accuracy',
+            patience=10,
+            restore_best_weights=True,
+            verbose=1,
+            start_from_epoch=15
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            best_model_path,
+            monitor='val_accuracy',
+            save_best_only=True,
+            verbose=1
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=7,
+            min_lr=1e-7,
+            verbose=1
+        )
+    ]
+
+    print("\nTRAINING START")
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    # Evaluate on validation set (fold score)
+    y_true, y_pred, y_probs = [], [], []
+    for x_batch, y_batch in val_ds:
+        probs = model(x_batch, training=False).numpy().reshape(-1)
+        preds = (probs >= 0.5).astype(np.int32)
+        y_true.extend(y_batch.numpy())
+        y_pred.extend(preds)
+        y_probs.extend(probs)
+
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    cm = tf.math.confusion_matrix(y_true, y_pred, num_classes=2).numpy()
+    fold_acc = float(np.mean(y_true == y_pred))
+    best_val_acc = float(np.max(history.history["val_accuracy"]))
+    best_val_auc = float(np.max(history.history["val_auc"]))
+
+    print(f"\nFold Val Accuracy: {fold_acc:.4f}")
+    print(f"Best Val Accuracy during training: {best_val_acc:.4f}")
+    print(f"Best Val AUC during training: {best_val_auc:.4f}")
+    print("Confusion Matrix:\n", cm)
+
+    # Save fold results
+    fold_result = {
+        "fold": fold,
+        "val_accuracy": fold_acc,
+        "best_val_accuracy": best_val_acc,
+        "best_val_auc": best_val_auc,
+        "confusion_matrix": cm.tolist(),
+        "model_path": best_model_path,
+        "metric_history": history.history
+    }
+
+    json_path = os.path.join(RESULT_DIR, f"cv_results_{fold_tag}.json")
+    with open(json_path, "w") as f:
+        json.dump(fold_result, f, indent=2)
+
+    fold_results.append(fold_result)
+    fold_histories.append(history.history)
+    fold_accs.append(fold_acc)
+    fold_aucs.append(best_val_auc)
+
+# -----------------------
+# 5) CV SUMMARY + PLOTS
+# -----------------------
+print("\n" + "="*60)
+print("CROSS-VALIDATION SUMMARY")
+print("="*60)
+
+for r in fold_results:
+    print(f"Fold {r['fold']}: val_acc={r['val_accuracy']:.4f} | best_val_acc={r['best_val_accuracy']:.4f} | best_val_auc={r['best_val_auc']:.4f}")
+
+print("\nMean val accuracy:", float(np.mean(fold_accs)))
+print("Std  val accuracy:", float(np.std(fold_accs)))
+print("Mean best val AUC:", float(np.mean(fold_aucs)))
+print("Std  best val AUC:", float(np.std(fold_aucs)))
+
+# Plot fold accuracies
+plt.figure()
+plt.plot(range(1, K_FOLDS + 1), fold_accs, marker="o")
+plt.xlabel("Fold")
+plt.ylabel("Validation Accuracy")
+plt.title("K-Fold CV Accuracy per Fold")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(RESULT_DIR, "cv_fold_accuracies.png"), dpi=200)
+plt.show()
+
+# Plot mean val accuracy curve across epochs (optional)
+# We will pad histories to the same length, then average.
+max_len = max(len(h["val_accuracy"]) for h in fold_histories)
+val_acc_matrix = np.full((K_FOLDS, max_len), np.nan, dtype=np.float32)
+
+for i, h in enumerate(fold_histories):
+    vals = np.array(h["val_accuracy"], dtype=np.float32)
+    val_acc_matrix[i, :len(vals)] = vals
+
+mean_val_acc = np.nanmean(val_acc_matrix, axis=0)
+
+plt.figure()
+plt.plot(np.arange(1, len(mean_val_acc) + 1), mean_val_acc, marker="o", markersize=3)
+plt.xlabel("Epoch")
+plt.ylabel("Mean Val Accuracy (across folds)")
+plt.title("Mean Validation Accuracy Across Folds (per Epoch)")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(RESULT_DIR, "cv_mean_val_accuracy_curve.png"), dpi=200)
+plt.show()
+
+print(f"\nSaved plots in: {RESULT_DIR}")
+print("Done.")
