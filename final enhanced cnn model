@@ -1,0 +1,288 @@
+# CNN training - FIXED for dark ultrasound images with subtle differences
+
+import os
+import json
+import numpy as np
+import tensorflow as tf
+import cv2
+from datetime import datetime
+
+# -----------------------
+# SETTINGS
+# -----------------------
+DATA_DIR = r"C:\\Users\\anakh\\Desktop\\MINI PROJECT\\muscle-bmode-images\\B-Bilder"
+IMG_SIZE = (224, 224)  
+BATCH_SIZE = 8 
+LR = 1e-4 
+SEED = 42
+EPOCHS = 100
+
+EXP_NAME = "cnn_enhanced_preprocessing"
+RESULT_DIR = os.path.join("results", EXP_NAME)
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+tf.random.set_seed(SEED)
+np.random.seed(SEED)
+
+# -----------------------
+# 1) LOAD DATA
+# -----------------------
+paths, labels = [], []
+for fname in os.listdir(DATA_DIR):
+    if not fname.lower().endswith(".png"):
+        continue
+    name = fname.lower()
+    if "longitudinal" in name:
+        label = 0
+    elif "transversal" in name:
+        label = 1
+    else:
+        continue
+    paths.append(os.path.join(DATA_DIR, fname))
+    labels.append(label)
+
+paths = np.array(paths)
+labels = np.array(labels, dtype=np.int32)
+
+print("Total images:", len(paths))
+print("Longitudinal:", int(np.sum(labels == 0)))
+print("Transversal:", int(np.sum(labels == 1)))
+
+# -----------------------
+# 2) SPLIT DATA
+# -----------------------
+idx = np.random.permutation(len(paths))
+paths, labels = paths[idx], labels[idx]
+
+n_total = len(paths)
+n_train = int(0.7 * n_total)
+n_val = int(0.15 * n_total)
+
+train_paths = paths[:n_train]
+train_labels = labels[:n_train]
+val_paths = paths[n_train:n_train + n_val]
+val_labels = labels[n_train:n_train + n_val]
+test_paths = paths[n_train + n_val:]
+test_labels = labels[n_train + n_val:]
+
+print(f"\nTrain: {len(train_paths)}, Val: {len(val_paths)}, Test: {len(test_paths)}")
+
+# -----------------------
+# 3) ENHANCED PREPROCESSING
+# -----------------------
+def enhance_image_py(img_np):
+    """Enhance dark ultrasound images - numpy function"""
+    img_2d = img_np.squeeze().astype(np.uint8)
+    
+    # 1. CLAHE for contrast
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img_enhanced = clahe.apply(img_2d)
+    
+    # 2. Normalize to use full range
+    min_val, max_val = img_enhanced.min(), img_enhanced.max()
+    if max_val > min_val:
+        img_enhanced = ((img_enhanced - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+    
+    # 3. Slight sharpening to enhance edges
+    kernel = np.array([[-1,-1,-1], [-1, 9,-1], [-1,-1,-1]]) / 1.0
+    img_sharp = cv2.filter2D(img_enhanced, -1, kernel)
+    img_sharp = np.clip(img_sharp, 0, 255).astype(np.uint8)
+    
+    return img_sharp[..., np.newaxis]
+
+def load_preprocess(path, label, augment=False):
+    # Read image
+    img_bytes = tf.io.read_file(path)
+    img = tf.io.decode_png(img_bytes, channels=1)
+    
+    # Resize FIRST to reduce computation
+    img = tf.image.resize(img, IMG_SIZE, method='bilinear')
+    
+    # Apply enhancement
+    img_uint8 = tf.cast(img, tf.uint8)
+    img = tf.numpy_function(enhance_image_py, [img_uint8], tf.uint8)
+    img.set_shape((IMG_SIZE[0], IMG_SIZE[1], 1))
+    img = tf.cast(img, tf.float32)
+    
+    # Strong augmentation for training
+    if augment:
+        # Flips
+        img = tf.image.random_flip_left_right(img)
+        img = tf.image.random_flip_up_down(img)
+        
+        # Brightness/contrast (applied to already enhanced image)
+        img = tf.image.random_brightness(img, max_delta=30)
+        img = tf.image.random_contrast(img, lower=0.8, upper=1.2)
+    
+    # Normalize to [-1, 1]
+    img = img / 127.5 - 1.0
+    
+    return img, label
+
+# -----------------------
+# 4) CREATE DATASETS
+# -----------------------
+AUTOTUNE = tf.data.AUTOTUNE
+
+train_ds = tf.data.Dataset.from_tensor_slices((train_paths, train_labels))
+train_ds = (train_ds
+    .shuffle(len(train_paths), seed=SEED, reshuffle_each_iteration=True)
+    .map(lambda p, l: load_preprocess(p, l, augment=True), num_parallel_calls=AUTOTUNE)
+    .batch(BATCH_SIZE)
+    .prefetch(AUTOTUNE))
+
+val_ds = tf.data.Dataset.from_tensor_slices((val_paths, val_labels))
+val_ds = (val_ds
+    .map(lambda p, l: load_preprocess(p, l, augment=False), num_parallel_calls=AUTOTUNE)
+    .batch(BATCH_SIZE)
+    .prefetch(AUTOTUNE))
+
+test_ds = tf.data.Dataset.from_tensor_slices((test_paths, test_labels))
+test_ds = (test_ds
+    .map(lambda p, l: load_preprocess(p, l, augment=False), num_parallel_calls=AUTOTUNE)
+    .batch(BATCH_SIZE)
+    .prefetch(AUTOTUNE))
+
+# -----------------------
+# 5) BUILD MODEL 
+# -----------------------
+def build_model():
+    inputs = tf.keras.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 1))
+    x = inputs
+    
+
+    x = tf.keras.layers.Conv2D(32, 3, padding='same', activation='relu')(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    
+    x = tf.keras.layers.Conv2D(64, 3, padding='same', activation='relu')(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    
+    x = tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu')(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dense( 64, activation='relu')(x)
+    x = tf.keras.layers.Dropout(0.4)(x)
+    
+    outputs = tf.keras.layers.Dense(1, activation='sigmoid')(x) 
+    return tf.keras.Model(inputs, outputs)
+
+model = build_model()
+
+# Compile with sigmoid output (not logits!)
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=LR),
+    loss='binary_crossentropy',  # No from_logits=True
+    metrics=['accuracy', 
+             tf.keras.metrics.Precision(name='precision'),
+             tf.keras.metrics.Recall(name='recall'),
+             tf.keras.metrics.AUC(name='auc')]
+)
+
+model.summary()
+
+
+# 6) CALLBACKS
+
+run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+best_model_path = os.path.join(RESULT_DIR, f"best_{run_id}.keras")
+
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor='val_accuracy',
+        patience=10,
+        restore_best_weights=True,
+        verbose=1,
+        start_from_epoch=15
+    ),
+    tf.keras.callbacks.ModelCheckpoint(
+        best_model_path,
+        monitor='val_accuracy',
+        save_best_only=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=7,
+        min_lr=1e-7,
+        verbose=1
+    )
+]
+
+# -----------------------
+# 7) TRAIN
+# -----------------------
+print("\n" + "="*50)
+print("TRAINING START")
+print("="*50)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# -----------------------
+# 8) EVALUATE
+# -----------------------
+print("\n" + "="*50)
+print("EVALUATION")
+print("="*50)
+
+y_true, y_pred, y_probs = [], [], []
+
+for x_batch, y_batch in test_ds:
+    probs = model(x_batch, training=False).numpy().reshape(-1)
+    preds = (probs >= 0.5).astype(np.int32)
+    
+    y_true.extend(y_batch.numpy())
+    y_pred.extend(preds)
+    y_probs.extend(probs)
+
+y_true = np.array(y_true)
+y_pred = np.array(y_pred)
+
+# Results
+cm = tf.math.confusion_matrix(y_true, y_pred, num_classes=2).numpy()
+test_acc = np.mean(y_true == y_pred)
+
+print(f"\nTest Accuracy: {test_acc:.4f}")
+print(f"\nConfusion Matrix:")
+print(cm)
+print("       Pred-0  Pred-1")
+print(f"True-0   {cm[0,0]:3d}     {cm[0,1]:3d}")
+print(f"True-1   {cm[1,0]:3d}     {cm[1,1]:3d}")
+
+if cm[0].sum() > 0:
+    print(f"\nLongitudinal (0) accuracy: {cm[0,0]/cm[0].sum():.3f}")
+if cm[1].sum() > 0:
+    print(f"Transversal (1) accuracy: {cm[1,1]/cm[1].sum():.3f}")
+
+print(f"\nPredictions: {np.sum(y_pred==0)} as Long, {np.sum(y_pred==1)} as Trans")
+print(f"Avg probability: {np.mean(y_probs):.3f}")
+
+
+results = {
+    "experiment": EXP_NAME,
+    "test_accuracy": float(test_acc),
+    "confusion_matrix": cm.tolist(),
+    "best_val_acc": float(max(history.history['val_accuracy'])),
+    "model_path": best_model_path,
+    "metric_history": history.history
+}
+
+json_path = os.path.join(RESULT_DIR, f"results_{run_id}.json")
+with open(json_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nResults saved: {json_path}")
+print(f"Model saved: {best_model_path}")
